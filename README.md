@@ -1,0 +1,1 @@
+riscv64-unknown-elf-gcc -ffreestanding -nostdlib -nostartfiles -fomit-frame-pointer -O3 -o a.out tests/add.c
