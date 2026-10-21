@@ -1,7 +1,5 @@
 int _start() {
-    register int a asm ("a1") = 1 ;
-    register int b asm ("a2") = 2;
-    asm volatile("" : "+r"(a));
-    asm volatile("" : "+r"(b));
+    int a = 3;
+    int b = 4;
     return a - b;
 }

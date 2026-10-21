@@ -5,4 +5,4 @@ edition = "2024"
 
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
-object = "0.40.0"
+object = { version = "0.40.0", features = ["read", "write", "elf", "names"] }
