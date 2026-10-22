@@ -1,9 +1,10 @@
+#![feature(generic_const_exprs)]
+use num_traits::{AsPrimitive, FromBytes, ToBytes};
+use object::elf::PT_LOAD;
 use object::read::elf::FileHeader;
 use object::{elf, LittleEndian};
 use std::fs::File;
 use std::io::Read;
-use object::elf::PT_LOAD;
-
 
 macro_rules! get_bit {
     ($val:expr, $n:expr) => {
@@ -17,24 +18,12 @@ macro_rules! get_bits { // https://stackoverflow.com/questions/39321580/fastest-
     };
 }
 
-fn read_u16(a: &[u8], b: u64) -> u16 {
-    u16::from_le_bytes(a[b as usize..(b + 2) as usize].try_into().unwrap())
+fn read_integer<T: FromBytes<Bytes = [u8; size_of::<T>()]>>(a: &[u8], b: impl AsPrimitive<usize>) -> T {
+    T::from_le_bytes(a[b.as_()..b.as_() + size_of::<T>()].try_into().unwrap())
 }
 
-fn read_u32(a: &[u8], b: u64) -> u32 {
-    u32::from_le_bytes(a[b as usize..(b + 4) as usize].try_into().unwrap())
-}
-
-fn read_i32(a: &[u8], b: u64) -> i32 {
-    i32::from_le_bytes(a[b as usize..(b + 4) as usize].try_into().unwrap())
-}
-
-fn write_i32(a: &mut [u8], b: u64, c: i32) {
-    a[b as usize..(b + 4) as usize].copy_from_slice(&c.to_le_bytes());
-}
-
-fn read_from_slice<T: bytemuck::Pod>(slice: &[u8], index: usize) -> T {
-    bytemuck::pod_read_unaligned(&slice[index * size_of::<T>()..(index + 1) * size_of::<T>()])
+fn write_integer<T>(a: &mut [u8], b: impl AsPrimitive<usize>, c: impl ToBytes<Bytes = [u8; size_of::<T>()]>) {
+    a[b.as_()..b.as_() + size_of::<T>()].copy_from_slice(&c.to_le_bytes());
 }
 
 fn sign_extend(a: u32, b: u32) -> i32 {
@@ -43,7 +32,7 @@ fn sign_extend(a: u32, b: u32) -> i32 {
 
 struct Cpu {
     memory: Vec<u8>,
-    registers: [i64; 32],
+    registers: [u64; 32],
     pc: u64,
 }
 
@@ -53,7 +42,11 @@ enum Instruction {
     ADDIW { rd: u8, rs1: u8, imm: i32 },
     SUBW { rd: u8, rs1: u8, rs2: u8 },
     SW { rs1: u8, rs2: u8, offset: u16 },
+    SD { rs1: u8, rs2: u8, offset: u16 },
     LW { rs1: u8, rd: u8, offset: u16 },
+    LD { rs1: u8, rd: u8, offset: u16 },
+    JAL { rd: u8, offset: i64 },
+    JALR { rs1: u8, rd: u8, offset: i64, compressed: bool },
     Unknown,
 }
 
@@ -65,6 +58,10 @@ fn decode_ci_lwsp(word: u16) -> (u8, u16) { // TODO: why does this exist
     (get_bits!(word, 11, 7) as u8, (get_bits!(word, 3, 2) << 6) | (get_bit!(word, 12) << 5) | (get_bits!(word, 6, 4) << 2))
 }
 
+fn decode_ci_ldsp(word: u16) -> (u8, u16) {
+    (get_bits!(word, 11, 7) as u8, (get_bits!(word, 4, 2) << 6) | (get_bit!(word, 12) << 5) | (get_bits!(word, 6, 5) << 3))
+}
+
 fn decode_cl(word: u16) -> (u8, u8, u8) { // TODO: distinguish between RV64C and RV32C
     (8 + get_bits!(word, 9, 7) as u8, (((get_bits!(word, 12, 10) << 1) | get_bit!(word, 6) | (get_bit!(word, 5) << 4)) << 2) as u8, 8 + get_bits!(word, 4, 2) as u8)
 }
@@ -73,12 +70,24 @@ fn decode_cr(word: u16) -> (u8, u8, u8) {
     (get_bit!(word, 12) as u8, get_bits!(word, 11, 7) as u8, get_bits!(word, 6, 2) as u8)
 }
 
-fn decode_css(word: u16) -> (u8, u8) {
-    (((get_bits!(word, 12, 9) << 2) | (get_bits!(word, 8, 7) << 6)) as u8, get_bits!(word, 6, 2) as u8)
+fn decode_css_w(word: u16) -> (u16, u8) {
+    ((get_bits!(word, 12, 9) << 2) | (get_bits!(word, 8, 7) << 6), get_bits!(word, 6, 2) as u8)
+}
+
+fn decode_css_d(word: u16) -> (u16, u8) { // scrambling is different
+    ((get_bits!(word, 12, 10) << 3) | (get_bits!(word, 9, 7) << 6), get_bits!(word, 6, 2) as u8)
 }
 
 fn decode_r_type(dword: u32) -> (u8, u8, u8, u8, u8) { // fix typing
     (get_bits!(dword, 31, 25) as u8, get_bits!(dword, 24, 20) as u8, get_bits!(dword, 19, 15) as u8, get_bits!(dword, 14, 12) as u8, get_bits!(dword, 11, 7) as u8)
+}
+
+fn decode_r_type_imm(dword: u32) -> (u16, u8, u8, u8) { // fix typing
+    (get_bits!(dword, 31, 20) as u16, get_bits!(dword,19, 15) as u8, get_bits!(dword, 14, 12) as u8, get_bits!(dword, 11, 7) as u8)
+}
+
+fn decode_j_type(dword: u32) -> (u8, u32) {
+    (get_bits!(dword, 11, 7) as u8, (get_bit!(dword, 31) << 20) | (get_bits!(dword, 30, 21) << 1) | (get_bit!(dword, 20) << 11) | (get_bits!(dword, 19, 12) << 12))
 }
 
 fn execute_instruction(cpu: &mut Cpu, instr: Instruction) {
@@ -87,25 +96,42 @@ fn execute_instruction(cpu: &mut Cpu, instr: Instruction) {
             cpu.registers[rd as usize] = cpu.registers[rs1 as usize] + cpu.registers[rs2 as usize];
         }
         Instruction::ADDI { rd, rs1, imm } => {
-            cpu.registers[rd as usize] = cpu.registers[rs1 as usize] + imm;
+            cpu.registers[rd as usize] = (cpu.registers[rs1 as usize] as i64 + imm) as u64;
         }
         Instruction::ADDIW { rd, rs1, imm } => {
-            cpu.registers[rd as usize] = (cpu.registers[rs1 as usize] as i32 + imm)  as i64;
+            cpu.registers[rd as usize] = (cpu.registers[rs1 as usize] as i32 + imm) as i64 as u64;
         }
-        Instruction::SUBW { rd, rs1, rs2 } => { // ok to explain casts here usize is bc rust is a pos, i32 is to discard high bits and i64 is to sign extend the result
-            cpu.registers[rd as usize] = (cpu.registers[rs1 as usize] as i32 - cpu.registers[rs2 as usize] as i32) as i64;
+        Instruction::SUBW { rd, rs1, rs2 } => { // w instructions must have i32 -> i64 -> u64
+            cpu.registers[rd as usize] = (cpu.registers[rs1 as usize] as i32 - cpu.registers[rs2 as usize] as i32) as i64 as u64;
         }
         Instruction::SW { rs1, rs2, offset } => {
-            let addr = cpu.registers[rs1 as usize] + offset as i64;
-            write_i32(&mut cpu.memory, addr as u64, cpu.registers[rs2 as usize] as i32);
+            let addr = cpu.registers[rs1 as usize] as i64 + offset as i64;
+            write_integer::<i32>(&mut cpu.memory, addr, cpu.registers[rs2 as usize] as i32);
+        }
+        Instruction::SD { rs1, rs2, offset } => {
+            let addr = cpu.registers[rs1 as usize] as i64 + offset as i64;
+            write_integer::<i64>(&mut cpu.memory, addr, cpu.registers[rs2 as usize]);
         }
         Instruction::LW { rs1, rd, offset } => {
-            let addr = cpu.registers[rs1 as usize] + offset as i64;
-            cpu.registers[rd as usize] = read_i32(&cpu.memory, addr as u64) as i64;
+            let addr = cpu.registers[rs1 as usize] as i64 + offset as i64;
+            cpu.registers[rd as usize] = read_integer::<i32>(&cpu.memory, addr as u64) as i64 as u64;
+        }
+        Instruction::LD { rs1, rd, offset } => {
+            let addr = cpu.registers[rs1 as usize] as i64 + offset as i64;
+            cpu.registers[rd as usize] = read_integer::<i64>(&cpu.memory, addr as u64) as u64;
+        }
+        Instruction::JAL { rd, offset } => { // check if rd = x0
+            cpu.registers[rd as usize] = cpu.pc + 4;
+            cpu.pc = (cpu.pc as i64 + offset) as u64;
+        }
+        Instruction::JALR { rs1, rd, offset, compressed } => {
+            let target = (cpu.registers[rs1 as usize] as i64 + offset) & !1;
+            cpu.registers[rd as usize] = cpu.pc + if compressed { 2 } else { 4 };
+            cpu.pc = target as u64;
         }
         Instruction::Unknown => { },
-        _ => {  },
     };
+    cpu.registers[0] = 0; // hack fix this later
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -146,33 +172,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut registers = [0i64; 32]; // x0 = 0 always, x11 = a1, x12 = a2;
-    registers[2] = (max_vaddr + STACK_SIZE) as i64; // x2 = sp
+    let mut registers = [0u64; 32]; // x0 = 0 always, x11 = a1, x12 = a2;
+    registers[2] = (max_vaddr + STACK_SIZE) as i64 as u64; // x2 = sp
 
-    let mut cpu = Cpu { memory, registers, pc: u64::from(elf.e_entry) };
+    let mut cpu = Cpu { memory, registers, pc: elf.e_entry.get(LittleEndian) };
 
     // shitty code should work for now
-    while cpu.pc < u64::from(elf.e_entry) + u64::from(text.sh_size) {
-        let word = read_u16(&cpu.memory, cpu.pc);
-        let instr = if (word & 0b11) == 0b11 {
-            let dword = read_u32(&cpu.memory, cpu.pc);
-            cpu.pc += 4;
+    while  cpu.pc >= text.sh_addr.get(LittleEndian) && cpu.pc < (text.sh_addr.get(LittleEndian) + text.sh_size.get(LittleEndian)) {
+        let word = read_integer::<u16>(&cpu.memory, cpu.pc);
+        let uncompressed = (word & 0b11) == 0b11;
+        let instr = if uncompressed {
+            let dword = read_integer::<u32>(&cpu.memory, cpu.pc);
             let opcode = get_bits!(dword, 6, 0);
-            match opcode {
+            let a = match opcode {
                 0b0111011 => {
                     let (funct7, rs2, rs1, funct3, rd) = decode_r_type(dword);
                     match (funct7, funct3) {
                         (0b0100000, 0b000) => Instruction::SUBW { rd, rs1, rs2 },
                         _ => Instruction::Unknown,
                     }
+                },
+                0b0010011 => {
+                    let (imm, rs1, funct3, rd) = decode_r_type_imm(dword);
+                    match funct3 {
+                        0b000 => Instruction::ADDI { rd, rs1, imm: sign_extend(imm as u32, 12) as i64 },
+                        _ => Instruction::Unknown,
+                    }
+                },
+                0b1101111 => {
+                    let (rd, imm) = decode_j_type(dword); // figure out jalr
+                    Instruction::JAL { rd, offset: sign_extend(imm, 21) as i64 }
                 }
                 _ => Instruction::Unknown,
+            };
+            if let Instruction::Unknown = a {
+
             }
+            a
         } else { // compressed instruction
-            cpu.pc += 2;
             let op = get_bits!(word, 1, 0);
             let funct3 = get_bits!(word, 15, 13);
-            match op {
+            let a = match op {
                 0b01 => match funct3 {
                     0b010 => { // li
                         let (rd, imm) = decode_ci(word);
@@ -185,6 +225,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     0b001 => { // addiw jal apparently takes the same code point but is 32 only verify that
                         let (rd, imm) = decode_ci(word);
                         Instruction::ADDIW { rd, rs1: rd, imm: sign_extend(imm as u32, 6) }
+                    }
+                    0b011 => {
+                        let (rd, _) = decode_ci(word);
+                        if rd == 2 { // addi16sp
+                            let imm = get_bit!(word, 12) << 9 |  get_bit!(word, 6) << 4 | get_bit!(word, 5) << 6 | get_bits!(word, 4, 3) << 7 | get_bit!(word, 2) << 5;
+                            Instruction::ADDI { rd, rs1: 2, imm: sign_extend(imm as u32, 10) as i64 }
+                        } else { // lui
+                            Instruction::Unknown
+                        }
                     }
                     _ => Instruction::Unknown
                 },
@@ -203,8 +252,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     0b100 => { // j[al]r/mv/add
                         let (bit, rs1, rs2) = decode_cr(word);
                         if bit == 0 {
-                            if rs1 != 0 && rs2 != 0 {
-                                Instruction::ADD { rd: rs1, rs1: 0, rs2 }
+                            if rs1 != 0 {
+                                if rs2 != 0 { // mv
+                                    Instruction::ADD { rd: rs1, rs1: 0, rs2 }
+                                } else { // jr
+                                    Instruction::JALR { rs1, rd: 0, offset: 0, compressed: true }
+                                }
                             } else {
                                 Instruction::Unknown
                             }
@@ -213,19 +266,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     0b110 => { // swsp
-                        let (offset, rs2) = decode_css(word);
-                        Instruction::SW { rs1: 2, rs2, offset: offset as u16 }
+                        let (offset, rs2) = decode_css_w(word);
+                        Instruction::SW { rs1: 2, rs2, offset }
                     },
                     0b010 => { // lwsp
                         let (rd, offset) = decode_ci_lwsp(word);
                         Instruction::LW { rs1: 2, rd, offset }
-                    }
+                    },
+                    0b111 => { // sdsp
+                        let (offset, rs2) = decode_css_d(word);
+                        Instruction::SD { rs1: 2, rs2, offset }
+                    },
+                    0b011 => { // ldsp
+                        let (rd, offset) = decode_ci_ldsp(word);
+                        Instruction::LD { rs1: 2, rd, offset }
+                    },
                     _ => Instruction::Unknown,
                 }
                 _ => Instruction::Unknown
+            };
+            if let Instruction::Unknown = a {
+
             }
+            a
         };
+        if let Instruction::JAL { rd: _, offset: _ } = instr {} // another hack
+        else if let Instruction::JALR { rs1: _, rd: _, offset: _, compressed: _ } = instr {}
+        else {
+            cpu.pc += if uncompressed { 4 } else { 2 };
+        }
         execute_instruction(&mut cpu, instr);
     }
+    println!("result: {}", cpu.registers[10] as i64);
     Ok(())
 }
